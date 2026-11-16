@@ -2,6 +2,7 @@ import websocket
 import json
 import os
 import time
+import logging
 from quixstreams import Application
 from quixstreams.models import TopicConfig
 
@@ -10,7 +11,7 @@ This script demonstrates how to use a Kafka producer to stream real-time
 events from Bluesky Jetstream to a Kafka topic.
 
 NOTE that it does not parse/consume messages, it publishes/produces them to Kafka.
-Kafka publishing is currently commented out; the script only reads the stream.
+Kafka publishing is enabled; each commit event is produced to the `bluesky-events` topic.
 
 If the connection drops, it reconnects with exponential backoff and resumes from the
 last event it saw, using Jetstream's `cursor` parameter (a unix timestamp in microseconds).
@@ -63,29 +64,42 @@ cursor = None                              # time_us of the most recent event se
 backoff = 1                                # Current reconnect delay in seconds
 stop = False                               # Set on Ctrl-C to break out of the reconnect loop
 
-# KAFKA_BROKER = os.getenv("KAFKA_BROKER", "127.0.0.1:19092,127.0.0.1:29092,127.0.0.1:39092")
-#
-# app = Application(
-#     broker_address=KAFKA_BROKER,
-#     producer_extra_config={
-#         "broker.address.family": "v4",
-#         # Batch settings for better throughput
-#         "linger.ms": 5,  # Wait up to 5ms to batch messages
-#         "batch.size": 100000,  # Batch up to 100KB
-#     }
-# )
-# topic = app.topic(
-#     name="bluesky-events",
-#     value_serializer="json",
-#     config=TopicConfig(
-#         num_partitions=1,
-#         replication_factor=3,
-#         extra_config={"retention.ms": str(TOPIC_RETENTION_MS)}
-#     )
-# )
-#
-# # Create a kafka producer, reused for every message
-# producer = app.get_producer()
+KAFKA_BROKER = os.getenv("KAFKA_BROKER", "127.0.0.1:19092,127.0.0.1:29092,127.0.0.1:39092")
+
+app = Application(
+    broker_address=KAFKA_BROKER,
+    producer_extra_config={
+        "broker.address.family": "v4",
+        # Batch settings for better throughput
+        "linger.ms": 5,  # Wait up to 5ms to batch messages
+        "batch.size": 100000,  # Batch up to 100KB
+    }
+)
+topic = app.topic(
+    name="bluesky-events",
+    value_serializer="json",
+    config=TopicConfig(
+        num_partitions=1,
+        replication_factor=3,
+        extra_config={"retention.ms": str(TOPIC_RETENTION_MS)}
+    )
+)
+
+# Create a kafka producer, reused for every message
+producer = app.get_producer()
+
+# Log to a local file alongside the script
+logging.basicConfig(
+    filename=os.path.join(os.path.dirname(os.path.abspath(__file__)), "bluesky-producer.log"),
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("bluesky-producer")
+
+# Throughput counter: messages produced since the last report
+RATE_INTERVAL = 5                          # Seconds between msgs/sec reports
+msg_count = 0
+last_report = time.time()
 
 
 def on_open(ws):
@@ -96,7 +110,7 @@ def on_open(ws):
 
 def on_message(ws, message):
     """Handle each Jetstream event: track cursor, skip non-commit events, key by DID, (optionally) produce to Kafka."""
-    global cursor
+    global cursor, msg_count, last_report
     try:
         data = json.loads(message)
 
@@ -110,12 +124,25 @@ def on_message(ws, message):
         # The DID (decentralized identifier) uniquely identifies the acting user
         did = data["did"]
 
-        print(did)
+        # Serialize (DID as key, full event as JSON value) and hand to the producer
+        msg = topic.serialize(key=did, value=data)
+        producer.produce(topic=topic.name, key=msg.key, value=msg.value)
+
+        # Every RATE_INTERVAL seconds, report msgs/sec and reset the counter
+        msg_count += 1
+        now = time.time()
+        if now - last_report >= RATE_INTERVAL:
+            rate = msg_count / (now - last_report)
+            print(f"{rate:,.0f} msgs/sec")
+            log.info(f"{rate:.0f} msgs/sec (cursor {cursor})")
+            msg_count, last_report = 0, now
 
     except (json.JSONDecodeError, KeyError) as e:
         print(f"Bad message ({type(e).__name__}: {e})")
+        log.warning(f"Bad message ({type(e).__name__}: {e})")
     except Exception as e:
         print(f"Unexpected error handling message: {e}")
+        log.exception("Unexpected error handling message")
 
 def on_error(ws, error):
     """Report WebSocket-level errors. Ctrl-C arrives here too (websocket-client swallows it), so flag a stop."""
@@ -124,6 +151,7 @@ def on_error(ws, error):
         stop = True
     else:
         print(f"WebSocket error: {error}")
+        log.error(f"WebSocket error: {error}")
 
 def on_close(ws, close_status_code, close_msg):
     print(f"WebSocket closed ({close_status_code}: {close_msg})")
@@ -151,5 +179,6 @@ except KeyboardInterrupt:
     pass
 finally:
     print("\nStopped.")
-    # Ensure we flush on exit
-    # producer.flush()
+    # Ensure buffered messages are delivered before exiting
+    producer.flush()
+    log.info("Producer flushed; stopped.")
